@@ -66,6 +66,14 @@ def parse_lap_time(text):
     return minutes * 60 + float(match.group(2))
 
 
+def to_int_or_nan(value):
+    """Turns '3' into 3. Anything missing or non-numeric (None, '-') becomes NaN."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return np.nan
+
+
 def is_finisher(status):
     """'Finished' and '+1 Lap', '+2 Laps'... are finishers; anything else is a DNF."""
     return status == "Finished" or status.startswith("+") or status == "Lapped"
@@ -129,9 +137,11 @@ def build_standings_table(raw, list_key, entity_key, id_key, prefix):
             rows.append({
                 "round": as_of_round + 1,  # <-- the leakage shift
                 id_key: e[entity_key][id_key],
-                f"{prefix}_points_before": float(e["points"]),
-                f"{prefix}_position_before": int(e["position"]),
-                f"{prefix}_wins_before": int(e["wins"]),
+                f"{prefix}_points_before": float(e.get("points", 0)),
+                # Some entries have no 'position' (the API leaves it out for drivers
+                # without a ranking); we keep those as empty (NaN) instead of crashing.
+                f"{prefix}_position_before": to_int_or_nan(e.get("position", e.get("positionText"))),
+                f"{prefix}_wins_before": to_int_or_nan(e.get("wins", 0)),
             })
     return pd.DataFrame(rows)
 
