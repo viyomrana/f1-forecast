@@ -1,31 +1,35 @@
 """
-F1 Forecast - Phase 4 (version 3): Race Outcome Prediction + Extended Backtest
+F1 Forecast - Phase 4 (version 4): Race Outcome Prediction + Extended Backtest
 ==============================================================================
 Reads the feature table, tries several prediction setups, and tests each one
 HONESTLY on races it has never seen.
 
-What is new in version 3
+What is new in version 4
 ------------------------
-1. Bigger test: every race from round 4 onward is a test race (about 17 instead
-   of 5). Each is predicted using ONLY the races before it (walk-forward).
-2. More baselines: besides "everyone finishes where they started" (grid), it now
-   also tries "finish in qualifying order" and "finish in championship order".
-3. Tyre features: if data/processed/features_tyre.csv exists (made by
-   build_tyre_features.py), every model is also run WITH the tyre features
-   (names ending in _tyre), so you can see whether they help.
-4. Fairer winner pick: the best setup is chosen on the FIRST half of the test
-   races and scored on the SECOND half, which it never influenced.
-5. Tie-breaks no longer use the real finishing order (v2 let ties in the grid
-   baseline be broken by the true result, which flattered the baseline slightly).
+1. No more near-duplicate columns. "grid" and "quali_position" are almost the same
+   number, which made the linear model's coefficients meaningless. The simple setups
+   now use quali_position plus grid_penalty (= grid minus quali_position, i.e. how
+   many places a driver lost to a penalty).
+2. Optional feature groups from build_tyre_features.py are each tested with and
+   without: the TYRE group (team_deg_*) and the race PACE group (team_pace_*).
+   Setups with a group get a suffix such as _tyre or _pace.
+3. The verdict now compares the chosen model with the STRONGEST simple rule
+   (usually "finish in qualifying order"), not only with the grid.
 
-Setups
+Kept from version 3: every race from round 4 onward is a test race; each is
+predicted using only the races before it; the best setup is chosen on the first
+half of the test races and scored on the second half.
+
+Simple rules (no model)
+-----------------------
+  grid_baseline / quali_baseline / standings_baseline
+
+Models
 ------
-  grid_baseline / quali_baseline / standings_baseline : no model, just a rule
   xgb_v1_position      : XGBoost predicts the finishing position
   xgb_vs_grid          : XGBoost predicts places gained or lost versus the grid
   xgb_vs_grid_simple   : same, fewer features, more cautious model
   ridge_vs_grid_simple : plain linear model on the same few features
-  ...each also with "_tyre" if tyre features are available.
 
 Metrics (per race, then averaged)
 ---------------------------------
@@ -64,7 +68,7 @@ from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
 FEATURES_FILE = os.path.join("data", "processed", "features.csv")
-TYRE_FEATURES_FILE = os.path.join("data", "processed", "features_tyre.csv")
+LAP_FEATURES_FILE = os.path.join("data", "processed", "features_tyre.csv")
 PREDICTIONS_FILE = os.path.join("data", "processed", "backtest_predictions.csv")
 METRICS_FILE = os.path.join("data", "processed", "backtest_metrics.csv")
 MODEL_DIR = "models"
@@ -73,13 +77,15 @@ INFO_FILE = os.path.join(MODEL_DIR, "best_model_info.json")
 
 MIN_TRAIN_ROUNDS = 3     # the first test race is the one after this many rounds
 MIN_RACES_TO_SPLIT = 6   # need at least this many test races to split them in two
-TYRE_PREFIX = "team_deg_"
+
+# Optional feature groups: name used in setup names -> column prefix
+FEATURE_GROUPS = {"tyre": "team_deg_", "pace": "team_pace_"}
 
 ID_COLS = ["round", "race_name", "driver_id", "constructor_id"]
 TARGET_COLS = ["finish_position", "points", "podium", "points_finish", "is_dnf", "status"]
 
 SIMPLE_FEATURES = [
-    "grid", "quali_position", "quali_gap_to_pole_pct",
+    "quali_position", "grid_penalty", "quali_gap_to_pole_pct",
     "team_position_before", "team_avg_points_recent", "driver_avg_points_recent",
 ]
 
@@ -93,17 +99,22 @@ METRICS = ["mae", "mae_finishers", "rank_corr", "winner_correct", "podium_overla
 
 
 def load_data():
-    path = TYRE_FEATURES_FILE if os.path.exists(TYRE_FEATURES_FILE) else FEATURES_FILE
+    path = LAP_FEATURES_FILE if os.path.exists(LAP_FEATURES_FILE) else FEATURES_FILE
     if not os.path.exists(path):
         raise SystemExit(f"{FEATURES_FILE} not found. Run build_features.py first.")
     df = pd.read_csv(path)
+    if {"grid", "quali_position"} <= set(df.columns):
+        df["grid_penalty"] = df["grid"] - df["quali_position"]
     all_features = [c for c in df.columns if c not in ID_COLS + TARGET_COLS]
-    tyre = [c for c in all_features if c.startswith(TYRE_PREFIX)]
-    base = [c for c in all_features if c not in tyre]
-    return df, base, tyre, path
+    groups = {name: [c for c in all_features if c.startswith(prefix)]
+              for name, prefix in FEATURE_GROUPS.items()}
+    groups = {name: cols for name, cols in groups.items() if cols}
+    grouped = {c for cols in groups.values() for c in cols}
+    base = [c for c in all_features if c not in grouped]
+    return df, base, groups, path
 
 
-def build_setups(base, tyre):
+def build_setups(base, groups):
     """
     Each setup: model builder (None = rule-based baseline), features, target
     ('position' or 'delta' = change versus grid), and for baselines the column to sort by.
@@ -124,9 +135,9 @@ def build_setups(base, tyre):
     }
     for name, (builder, feats, target) in models.items():
         setups[name] = dict(model=builder, features=feats, target=target)
-        if tyre:
-            setups[name + "_tyre"] = dict(model=builder, features=feats + tyre, target=target)
-    return setups
+        for group, cols in groups.items():
+            setups[f"{name}_{group}"] = dict(model=builder, features=feats + cols, target=target)
+    return setups, list(models)
 
 
 def training_target(df, target):
@@ -189,12 +200,21 @@ def summarise(results, order):
     return results.groupby("setup")[METRICS].mean().reindex(order)
 
 
+def compare_text(gap, wins, n_races):
+    """gap = other's MAE minus the chosen model's MAE (positive = chosen model is better)."""
+    if gap >= 0.1 and wins > n_races / 2:
+        return "clearly better"
+    if gap > -0.1:
+        return "about level"
+    return "worse"
+
+
 def main():
     last_n = int(sys.argv[1]) if len(sys.argv) > 1 else None
 
-    print("=== F1 Forecast: Phase 4 Race Outcome Model (version 3) ===\n")
-    df, base, tyre, path = load_data()
-    setups = build_setups(base, tyre)
+    print("=== F1 Forecast: Phase 4 Race Outcome Model (version 4) ===\n")
+    df, base, groups, path = load_data()
+    setups, base_model_names = build_setups(base, groups)
     model_names = [n for n, s in setups.items() if s["model"] is not None]
     baseline_names = [n for n, s in setups.items() if s["model"] is None]
 
@@ -205,12 +225,13 @@ def main():
     if len(test_rounds) < 1:
         raise SystemExit(f"Only {len(rounds)} rounds available: too few to test.")
 
+    group_text = " + ".join(f"{len(cols)} {name}" for name, cols in groups.items()) or "no extra groups"
     print(f"Data file: {path}")
-    print(f"Rows: {len(df)} | Rounds: {len(rounds)} | Features: {len(base)} base + {len(tyre)} tyre")
+    print(f"Rows: {len(df)} | Rounds: {len(rounds)} | Features: {len(base)} base + {group_text}")
     print(f"Backtest: {len(test_rounds)} test races (rounds {test_rounds[0]} to {test_rounds[-1]}), "
           f"each predicted using only earlier rounds")
-    if not tyre:
-        print("No tyre features found (run build_tyre_features.py to add them).")
+    if not groups:
+        print("No tyre or pace features found (run build_tyre_features.py to add them).")
 
     results, predictions = run_backtest(df, setups, test_rounds)
     order = list(setups.keys())
@@ -238,40 +259,35 @@ def main():
     print(final_table.round(3).to_string())
     print(f"\nChosen setup: {best_name}")
 
-    fin = results[results["round"].isin(final_rounds)].pivot(index="round", columns="setup", values="mae")
-    best_final, grid_final = final_table.loc[best_name, "mae"], final_table.loc["grid_baseline", "mae"]
-    wins = int((fin[best_name] < fin["grid_baseline"]).sum())
-    print(f"Held-out races: MAE {best_final:.3f} vs grid baseline {grid_final:.3f}; "
-          f"better than the grid in {wins} of {len(final_rounds)} races")
-    for b in baseline_names:
-        if b != "grid_baseline":
-            print(f"   (for comparison, {b}: MAE {final_table.loc[b, 'mae']:.3f})")
+    per_race = results[results["round"].isin(final_rounds)].pivot(index="round", columns="setup", values="mae")
+    strongest = final_table.loc[baseline_names, "mae"].idxmin()
+    best_final = final_table.loc[best_name, "mae"]
+    n_final = len(final_rounds)
+    print(f"Held-out races: chosen model MAE {best_final:.3f}")
+    for label, other in [("grid baseline", "grid_baseline"), (f"strongest rule ({strongest})", strongest)]:
+        other_mae = final_table.loc[other, "mae"]
+        wins = int((per_race[best_name] < per_race[other]).sum())
+        verdict = compare_text(other_mae - best_final, wins, n_final)
+        print(f"  vs {label}: {other_mae:.3f} -> {verdict} (better in {wins} of {n_final} races)")
     print("Winner picked correctly:",
           f"{best_name} {final_table.loc[best_name, 'winner_correct']:.0%}",
-          f"| grid baseline {final_table.loc['grid_baseline', 'winner_correct']:.0%}")
-    gap = grid_final - best_final
-    if gap >= 0.1 and wins > len(final_rounds) / 2:
-        verdict = "clearly beats the grid baseline on races it was not chosen on."
-    elif gap > -0.1:
-        verdict = "is about level with the grid baseline: no clear difference on the held-out races."
-    else:
-        verdict = "does NOT beat the grid baseline on the held-out races (an honest, normal result)."
-    print("Verdict:", verdict)
+          f"| grid baseline {final_table.loc['grid_baseline', 'winner_correct']:.0%}",
+          f"| {strongest} {final_table.loc[strongest, 'winner_correct']:.0%}")
 
-    if tyre:
-        print("\n--- Do the tyre features help? (average MAE over ALL test races) ---")
+    for group in groups:
+        print(f"\n--- Do the {group} features help? (average MAE over ALL test races) ---")
         overall = summarise(results, order)["mae"]
-        for name in model_names:
-            if not name.endswith("_tyre"):
-                with_t, without_t = overall[name + "_tyre"], overall[name]
-                verdict = "helps" if with_t < without_t - 0.01 else "hurts" if with_t > without_t + 0.01 else "no clear change"
-                print(f"  {name:<22} without {without_t:.3f} | with {with_t:.3f} | {verdict}")
+        for name in base_model_names:
+            with_g, without_g = overall[f"{name}_{group}"], overall[name]
+            verdict = ("helps" if with_g < without_g - 0.01
+                       else "hurts" if with_g > without_g + 0.01 else "no clear change")
+            print(f"  {name:<22} without {without_g:.3f} | with {with_g:.3f} | {verdict}")
 
     print(f"\n--- {best_name}, race by race (all test races) ---")
-    per_race = results[results["setup"] == best_name].drop(columns="setup").round(2)
+    per_race_table = results[results["setup"] == best_name].drop(columns="setup").round(2)
     names = df.drop_duplicates("round").set_index("round")["race_name"]
-    per_race.insert(1, "race", per_race["round"].map(names))
-    print(per_race.to_string(index=False))
+    per_race_table.insert(1, "race", per_race_table["round"].map(names))
+    print(per_race_table.to_string(index=False))
 
     predictions.to_csv(PREDICTIONS_FILE, index=False)
     results.to_csv(METRICS_FILE, index=False)

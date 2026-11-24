@@ -1,7 +1,7 @@
 """
-F1 Forecast - Phase 3 (part 3): Tyre Features for the Race Model
-================================================================
-Connects the tyre degradation work (Phase 3) to the race outcome model (Phase 4).
+F1 Forecast - Phase 3 (part 3): Lap-Based Features for the Race Model
+=====================================================================
+Connects the lap data (Phase 3) to the race outcome model (Phase 4).
 
 It reads:
   - data/processed/features.csv   (from build_features.py)
@@ -9,21 +9,29 @@ It reads:
   - data/raw/results_round_*.json (from ingest_2026.py; only to match FastF1
                                    driver codes such as "RUS" to team names)
 
-and writes data/processed/features_tyre.csv: the same table plus two new columns
-for every driver-race row:
+and writes data/processed/features_tyre.csv: the same table plus four new columns
+for every driver-race row, in two groups.
 
-  team_deg_avg_before      : how many seconds per lap the team's cars lose as their
-                             tyres age (averaged over compounds, weighted by laps)
-  team_deg_vs_field_before : the same, minus the whole field's rate on the same
-                             compounds. Positive = the team wears tyres faster than
-                             average, negative = kinder to its tyres.
+TYRE group (how fast the team's tyres wear)
+  team_deg_avg_before        seconds lost per lap of tyre age (averaged over compounds)
+  team_deg_vs_field_before   the same minus the whole field's rate; positive = harder
+                             on its tyres than average
+
+PACE group (how quick the team is in the RACE compared with qualifying)
+  team_pace_gap_before       average % gap to the quickest team's race pace
+                             (same compound, fuel-corrected laps), last 3 races
+  team_pace_vs_quali_before  that race gap minus the team's qualifying gap, last 3
+                             races. Positive = slower in the race than qualifying
+                             suggests, negative = quicker in the race than in qualifying.
+                             This is information that qualifying order alone does not hold.
 
 THE LEAKAGE RULE
 ----------------
-For race N, a team's degradation is measured ONLY from laps of rounds 1 .. N-1.
-(tyre_degradation_by_team.csv uses the whole season, so it must NOT be merged
-directly: race 5 would then be predicted using laps from races 6 onwards.)
-Early rounds therefore have empty values (NaN) until enough stints have been seen.
+For race N, every value is built ONLY from rounds 1 .. N-1 (laps and qualifying of
+earlier races). The tyre part re-measures degradation from earlier laps for every
+race, and the pace part is shifted by one race. tyre_degradation_by_team.csv uses
+the whole season, so it must NOT be merged directly.
+Early rounds therefore have empty values (NaN) until enough data has been seen.
 
 Run order:
     python build_features.py
@@ -48,7 +56,13 @@ CLEAN_LAPS_FILE = os.path.join(PROCESSED_DIR, "clean_laps.csv")
 OUT_FILE = os.path.join(PROCESSED_DIR, "features_tyre.csv")
 
 MIN_STINTS_FOR_RATE = 3  # same rule as tyre_degradation.py: need this many stints for a rate
-NEW_COLUMNS = ["team_deg_avg_before", "team_deg_vs_field_before"]
+MIN_LAPS_PACE = 10       # a team needs this many clean laps on a compound in a race to be compared
+MIN_TEAMS_PACE = 3       # and at least this many teams must have run that compound
+PACE_WINDOW = 3          # race pace = average of the previous 3 races
+
+TYRE_COLUMNS = ["team_deg_avg_before", "team_deg_vs_field_before"]
+PACE_COLUMNS = ["team_pace_gap_before", "team_pace_vs_quali_before"]
+NEW_COLUMNS = TYRE_COLUMNS + PACE_COLUMNS
 
 
 def load_driver_team_map():
@@ -67,17 +81,20 @@ def load_driver_team_map():
     return mapping
 
 
+# ---------------------------------------------------------------------------
+# Tyre group
+# ---------------------------------------------------------------------------
 def slope_rate(df):
     """Seconds lost per lap of tyre age, only where there are enough stints."""
     enough = (df["n_stints"] >= MIN_STINTS_FOR_RATE) & (df["xx"] > 0)
     return (df["xy"] / df["xx"].where(df["xx"] > 0)).where(enough)
 
 
-def features_before_round(agg, before_round):
+def tyre_features_before_round(agg, before_round):
     """Team tyre features for one race, using only rounds strictly before it."""
     prior = agg[agg["round"] < before_round]
     if prior.empty:
-        return pd.DataFrame(columns=["constructor_id"] + NEW_COLUMNS)
+        return pd.DataFrame(columns=["constructor_id"] + TYRE_COLUMNS)
 
     team = prior.groupby(["constructor_id", "Compound"])[["xy", "xx", "n_laps", "n_stints"]].sum().reset_index()
     field = prior.groupby("Compound")[["xy", "xx", "n_stints"]].sum()
@@ -95,19 +112,90 @@ def features_before_round(agg, before_round):
         rows.append({"constructor_id": constructor,
                      "team_deg_avg_before": avg,
                      "team_deg_vs_field_before": vs_field})
-    return pd.DataFrame(rows, columns=["constructor_id"] + NEW_COLUMNS)
+    return pd.DataFrame(rows, columns=["constructor_id"] + TYRE_COLUMNS)
 
 
+def build_tyre_group(laps, rounds):
+    laps = laps.copy()
+    laps["xy"] = laps["age_dev"] * laps["time_dev"]
+    laps["xx"] = laps["age_dev"] ** 2
+    stints = (laps.drop_duplicates(["round", "constructor_id", "Driver", "Stint"])
+              .groupby(["round", "constructor_id", "Compound"]).size().rename("n_stints"))
+    agg = (laps.groupby(["round", "constructor_id", "Compound"])
+           .agg(xy=("xy", "sum"), xx=("xx", "sum"), n_laps=("xy", "size"))
+           .join(stints).reset_index())
+    per_round = []
+    for r in rounds:
+        feats = tyre_features_before_round(agg, r)
+        if not feats.empty:
+            feats.insert(0, "round", r)
+            per_round.append(feats)
+    if not per_round:
+        return pd.DataFrame(columns=["round", "constructor_id"] + TYRE_COLUMNS)
+    return pd.concat(per_round, ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Pace group
+# ---------------------------------------------------------------------------
+def race_gap_by_team_round(laps):
+    """
+    For each race: how many % slower each team's typical fuel-corrected clean lap is
+    than the quickest team on the SAME compound (so tyre choice does not distort it),
+    averaged over compounds, weighted by number of laps.
+    """
+    rows = []
+    for round_number, race in laps.groupby("round"):
+        parts = []
+        for _, g in race.groupby("Compound"):
+            stats = g.groupby("constructor_id")["fuel_corrected_s"].agg(median="median", n="size")
+            stats = stats[stats["n"] >= MIN_LAPS_PACE]
+            if len(stats) < MIN_TEAMS_PACE:
+                continue
+            best = stats["median"].min()
+            stats["gap"] = (stats["median"] - best) / best * 100
+            parts.append(stats.reset_index())
+        if not parts:
+            continue
+        both = pd.concat(parts)
+        for team, t in both.groupby("constructor_id"):
+            rows.append({"round": round_number, "constructor_id": team,
+                         "race_gap_pct": np.average(t["gap"], weights=t["n"])})
+    return pd.DataFrame(rows, columns=["round", "constructor_id", "race_gap_pct"])
+
+
+def build_pace_group(features, laps):
+    race_gap = race_gap_by_team_round(laps)
+
+    # Team qualifying gap per round, relative to the best team that round
+    quali = (features.groupby(["round", "constructor_id"])["quali_gap_to_pole_pct"].mean()
+             .rename("quali_gap").reset_index())
+    quali["quali_gap"] = quali["quali_gap"] - quali.groupby("round")["quali_gap"].transform("min")
+
+    team_round = quali.merge(race_gap, on=["round", "constructor_id"], how="left")
+    team_round["race_vs_quali"] = team_round["race_gap_pct"] - team_round["quali_gap"]
+    team_round = team_round.sort_values(["constructor_id", "round"])
+
+    g = team_round.groupby("constructor_id")
+    for source, target in [("race_gap_pct", "team_pace_gap_before"),
+                           ("race_vs_quali", "team_pace_vs_quali_before")]:
+        # shift(1): the value for race N only uses races before N
+        team_round[target] = g[source].transform(
+            lambda s: s.shift(1).rolling(PACE_WINDOW, min_periods=1).mean())
+    return team_round[["round", "constructor_id"] + PACE_COLUMNS]
+
+
+# ---------------------------------------------------------------------------
 def main():
-    print("=== F1 Forecast: Tyre Features for the Race Model ===\n")
+    print("=== F1 Forecast: Lap-Based Features for the Race Model ===\n")
     for path, hint in [(FEATURES_FILE, "build_features.py"), (CLEAN_LAPS_FILE, "tyre_degradation.py")]:
         if not os.path.exists(path):
             raise SystemExit(f"{path} not found. Run {hint} first.")
 
     features = pd.read_csv(FEATURES_FILE)
     features = features.drop(columns=[c for c in NEW_COLUMNS if c in features.columns])
-    laps = pd.read_csv(CLEAN_LAPS_FILE,
-                       usecols=["round", "Driver", "Stint", "Compound", "age_dev", "time_dev"])
+    laps = pd.read_csv(CLEAN_LAPS_FILE, usecols=[
+        "round", "Driver", "Stint", "Compound", "age_dev", "time_dev", "fuel_corrected_s"])
 
     # Match FastF1 driver codes to Jolpica team names, race by race
     mapping = load_driver_team_map()
@@ -116,34 +204,28 @@ def main():
     laps = laps.dropna(subset=["constructor_id"])
     print(f"Clean laps used : {len(laps)}  (could not match to a team: {unmapped})")
 
-    laps["xy"] = laps["age_dev"] * laps["time_dev"]
-    laps["xx"] = laps["age_dev"] ** 2
-    stints = (laps.drop_duplicates(["round", "constructor_id", "Driver", "Stint"])
-              .groupby(["round", "constructor_id", "Compound"]).size().rename("n_stints"))
-    agg = (laps.groupby(["round", "constructor_id", "Compound"])
-           .agg(xy=("xy", "sum"), xx=("xx", "sum"), n_laps=("xy", "size"))
-           .join(stints).reset_index())
+    rounds = sorted(features["round"].unique())
+    tyre = build_tyre_group(laps, rounds)
+    pace = build_pace_group(features, laps)
 
-    per_round = []
-    for r in sorted(features["round"].unique()):
-        feats = features_before_round(agg, r)
-        feats.insert(0, "round", r)
-        per_round.append(feats)
-    tyre = pd.concat(per_round, ignore_index=True)
-
-    out = features.merge(tyre, on=["round", "constructor_id"], how="left")
+    out = (features.merge(tyre, on=["round", "constructor_id"], how="left")
+           .merge(pace, on=["round", "constructor_id"], how="left"))
     out.to_csv(OUT_FILE, index=False)
 
-    filled = out["team_deg_avg_before"].notna()
     print(f"Rows            : {len(out)}")
-    print(f"Rows with tyre features : {int(filled.sum())} ({filled.mean():.0%})")
-    if filled.any():
-        print(f"First round with values : {int(out.loc[filled, 'round'].min())}")
+    for label, col in [("tyre", "team_deg_avg_before"), ("pace", "team_pace_gap_before")]:
+        filled = out[col].notna()
+        first = int(out.loc[filled, "round"].min()) if filled.any() else None
+        print(f"Rows with {label} features : {int(filled.sum())} ({filled.mean():.0%}), first round with values: {first}")
     print(f"Saved to        : {OUT_FILE}\n")
+
     latest = out["round"].max()
-    print(f"Team tyre features going into round {latest}:")
-    print(out[out["round"] == latest].drop_duplicates("constructor_id")
-          [["constructor_id"] + NEW_COLUMNS].sort_values("team_deg_vs_field_before").round(4).to_string(index=False))
+    print(f"Team features going into round {latest}:")
+    table = (out[out["round"] == latest].drop_duplicates("constructor_id")
+             [["constructor_id"] + NEW_COLUMNS].sort_values("team_pace_gap_before"))
+    print(table.round(4).to_string(index=False))
+    print("\nteam_pace_gap_before: % slower than the quickest team in recent races (0 = quickest).")
+    print("team_pace_vs_quali_before: positive = slower in races than qualifying suggests.")
 
 
 if __name__ == "__main__":
